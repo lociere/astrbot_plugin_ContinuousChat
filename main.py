@@ -23,7 +23,7 @@ class UserSession:
     message_count: int = 0
     context_messages: List[Dict] = None
     timer: Optional[asyncio.TimerHandle] = None
-    persona_prompt: str = ""  # 新增：存储人格提示词
+    persona_prompt: str = ""  # 存储人格提示词
     
     def __post_init__(self):
         if self.context_messages is None:
@@ -330,9 +330,8 @@ class ContinuousDialoguePlugin(Star):
             if self._should_start_session(event):
                 success = await self._start_user_session(event)
                 if success:
-                    # 发送开始提示
-                    start_msg = "🎯 已开启连续对话模式！您可以继续与我对话，我会智能判断是否回复。输入'结束对话'可随时退出。"
-                    yield event.plain_result(start_msg)
+                    # 只记录日志，不发送提示消息
+                    logger.info(f"为用户 {user_id} 自动开启连续对话模式")
                     
                     # 处理当前触发消息
                     async for result in self._handle_in_session_message(event, session_key):
@@ -348,7 +347,8 @@ class ContinuousDialoguePlugin(Star):
         if any(end_cmd in user_message for end_cmd in ["结束对话", "退出对话", "结束"]):
             async with self.session_lock:
                 await self._close_user_session(session_key)
-            yield event.plain_result("👋 已结束连续对话，期待下次与您交流！")
+            # 只记录日志，不发送提示消息
+            logger.info(f"用户 {user_id} 结束连续对话")
             return
         
         async with self.session_lock:
@@ -393,8 +393,9 @@ class ContinuousDialoguePlugin(Star):
                 async with self.session_lock:
                     await self._close_user_session(session_key)
                 
+                # 只记录日志，不发送提示消息
                 end_reason = judgment_result.get("reason", "对话自然结束")
-                yield event.plain_result(f"💤 检测到对话结束信号: {end_reason}\n连续对话已自动结束。")
+                logger.info(f"用户 {user_id} 的连续对话已自动结束，原因: {end_reason}")
 
     @filter.command("对话状态")
     async def show_session_status(self, event: AstrMessageEvent):
@@ -450,7 +451,8 @@ class ContinuousDialoguePlugin(Star):
         async with self.session_lock:
             if session_key in self.user_sessions:
                 await self._close_user_session(session_key)
-                yield event.plain_result("👋 已结束连续对话")
+                # 只记录日志，不发送提示消息
+                logger.info(f"用户 {user_id} 通过命令结束连续对话")
             else:
                 yield event.plain_result("💤 您当前没有进行中的连续对话")
 
@@ -463,7 +465,8 @@ class ContinuousDialoguePlugin(Star):
             
         success = await self._start_user_session(event)
         if success:
-            yield event.plain_result("🎯 已开启连续对话模式！")
+            # 只记录日志，不发送提示消息
+            logger.info(f"用户 {user_id} 通过命令开启连续对话")
         else:
             yield event.plain_result("❌ 开启连续对话失败")
 
