@@ -29,12 +29,8 @@ class UserSession:
             self.context_messages = []
 
 
-@register("astrbot_plugin_continuous_dialogue",
-          "lociere", 
-          "智能连续对话插件，为用户提供沉浸式对话体验",
-          "1.0.0"
-          "https://github.com/lociere/astrbot_plugin_continuous_dialogue")
-class ContinuousDialogue(Star):
+# 修复：确保插件类在模块顶层定义
+class ContinuousDialoguePlugin(Star):
     """连续对话插件 - 基于AstrBot插件开发规范优化"""
     
     def __init__(self, context: Context, config: dict):
@@ -418,3 +414,13 @@ class ContinuousDialogue(Star):
                 await self._close_user_session(session_key)
                 
         logger.info("连续对话插件清理完成")
+
+
+# 修复：确保插件类被正确注册
+register(
+    ContinuousDialoguePlugin,
+    "continuous_dialogue_plugin",
+    "assistant",
+    "智能连续对话插件，为用户提供沉浸式对话体验",
+    "1.0.0"
+)
