@@ -2,21 +2,15 @@ import asyncio
 import json
 import re
 import time
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List
 from dataclasses import dataclass
 from asyncio import Lock
-from collections import defaultdict
 
-from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Star, register
+import astrbot.api.message_components as Comp
+from astrbot.api.event import AstrMessageEvent, filter, MessageEventResult
+from astrbot.api.star import Star, register, Context
 from astrbot.api import logger
-
-
-@register( "astrbot_plugin_ContinuousChat",
-            "lociere",
-            "智能连续对话插件，为用户提供沉浸式对话体验",
-            "1.0.0",
-            "https://github.com/lociere/astrbot_plugin_continuous_dialogue")
+from astrbot.core.conversation_mgr import Conversation
 
 
 @dataclass
@@ -27,7 +21,7 @@ class UserSession:
     start_time: float
     last_activity: float
     message_count: int = 0
-    context_messages: list = None
+    context_messages: List[Dict] = None
     timer: Optional[asyncio.TimerHandle] = None
     
     def __post_init__(self):
@@ -35,28 +29,37 @@ class UserSession:
             self.context_messages = []
 
 
-
+@register("continuous_dialogue_plugin",
+          "lociere", 
+          "智能连续对话插件，为用户提供沉浸式对话体验",
+          "1.0.0"
+          "https://github.com/lociere/astrbot_plugin_continuous_dialogue")
 class ContinuousDialoguePlugin(Star):
-    """连续对话插件"""
+    """连续对话插件 - 基于AstrBot插件开发规范优化"""
     
-    def __init__(self, context, config):
+    def __init__(self, context: Context, config: dict):
         super().__init__(context)
         self.config = config
         
-        # 会话管理
-        self.user_sessions: Dict[Tuple[str, str], UserSession] = {}  # (group_id, user_id) -> UserSession
-        self.session_lock = Lock()
-        
-        # 配置参数
-        self.session_timeout = self.config.get("session_timeout", 300)  # 会话超时时间（秒）
-        self.max_session_messages = self.config.get("max_session_messages", 20)  # 最大对话轮数
-        self.enable_commands = self.config.get("enable_commands", ["开始对话", "结束对话"])
+        # 从配置中读取参数
+        self.enable_plugin = self.config.get("enable_plugin", True)
+        self.session_timeout = self.config.get("session_timeout", 300)
+        self.max_session_messages = self.config.get("max_session_messages", 20)
         self.auto_start_on_mention = self.config.get("auto_start_on_mention", True)
+        self.judgment_threshold = self.config.get("judgment_threshold", 0.7)
+        self.enable_commands = self.config.get("enable_commands", ["开始对话", "连续对话", "开启对话"])
+        
+        # 会话管理
+        self.user_sessions: Dict[Tuple[str, str], UserSession] = {}
+        self.session_lock = Lock()
         
         logger.info("连续对话插件初始化完成")
 
     def _should_start_session(self, event: AstrMessageEvent) -> bool:
         """判断是否应该开始沉浸式对话"""
+        if not self.enable_plugin:
+            return False
+            
         # 检查是否被@（如果启用）
         if self.auto_start_on_mention and event.is_at_or_wake_command:
             return True
@@ -65,10 +68,7 @@ class ContinuousDialoguePlugin(Star):
         message_content = event.message_str.strip()
         start_commands = [cmd for cmd in self.enable_commands if cmd in message_content]
         
-        if start_commands:
-            return True
-            
-        return False
+        return bool(start_commands)
 
     async def _start_user_session(self, event: AstrMessageEvent) -> bool:
         """为用户开启沉浸式对话会话"""
@@ -161,18 +161,6 @@ class ContinuousDialoguePlugin(Star):
 ## 判断要求：
 请分析用户的意图和对话的连贯性，判断是否需要回复。
 
-**回复条件（满足以下任一条件即可回复）：**
-1. 用户的问题需要回答
-2. 对话需要继续推进
-3. 用户的发言有明显的互动意图
-4. 对话内容与当前话题相关
-
-**不回复条件（满足以下任一条件则不回复）：**
-1. 用户的发言是结束对话的信号（如"再见"、"结束"等）
-2. 发言与当前话题完全无关且无互动价值
-3. 用户明显是在自言自语
-4. 发言内容无意义或无法理解
-
 请以JSON格式回复：
 {{
     "should_reply": true/false,
@@ -222,18 +210,8 @@ class ContinuousDialoguePlugin(Star):
             if not provider:
                 return "抱歉，我现在无法回复您。"
             
-            # 构建生成提示词
-            generation_prompt = f"""
-请基于对话历史，自然地回复用户的最新消息。保持对话的连贯性和友好性。
-
-当前对话上下文：
-{json.dumps(current_context, ensure_ascii=False, indent=2) if current_context else "这是对话的开始"}
-
-请生成一个自然、连贯的回复：
-"""
-            
             llm_response = await provider.text_chat(
-                prompt=generation_prompt,
+                prompt=user_message,
                 contexts=current_context
             )
             
@@ -280,8 +258,8 @@ class ContinuousDialoguePlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_group_message(self, event: AstrMessageEvent):
-        """处理群消息"""
-        if not self.config.get("enable_plugin", True):
+        """处理群消息 - 使用事件监听器"""
+        if not self.enable_plugin:
             return
             
         group_id = event.get_group_id()
@@ -345,19 +323,25 @@ class ContinuousDialoguePlugin(Star):
         judgment_result = await self._judge_should_reply(event, session)
         
         logger.info(f"连续对话判断结果 - 用户: {user_id}, 回复: {judgment_result['should_reply']}, "
-                   f"置信度: {judgment_result.get('confidence', 0):.2f}, 理由: {judgment_result.get('reason', '')}")
+                   f"置信度: {judgment_result.get('confidence', 0):.2f}")
         
         if judgment_result["should_reply"]:
             # 生成并发送回复
             bot_reply = await self._generate_reply(event, session)
-            yield event.plain_result(bot_reply)
+            
+            # 使用消息链构建更丰富的回复
+            reply_chain = [
+                Comp.Plain(text=bot_reply)
+            ]
+            
+            yield event.chain_result(reply_chain)
             
             # 更新对话历史
             await self._update_conversation_history(event, session, user_message, bot_reply)
         else:
             # 不回复，检查是否需要结束会话
             confidence = judgment_result.get("confidence", 0)
-            if confidence > 0.7:  # 高置信度判断不需要回复时，结束会话
+            if confidence > self.judgment_threshold:
                 async with self.session_lock:
                     await self._close_user_session(session_key)
                 
@@ -367,6 +351,10 @@ class ContinuousDialoguePlugin(Star):
     @filter.command("对话状态")
     async def show_session_status(self, event: AstrMessageEvent):
         """显示当前对话状态"""
+        if not self.enable_plugin:
+            yield event.plain_result("❌ 插件未启用")
+            return
+            
         group_id = event.get_group_id()
         user_id = event.get_sender_id()
         session_key = (group_id, user_id)
@@ -393,6 +381,10 @@ class ContinuousDialoguePlugin(Star):
     @filter.command("结束对话")
     async def end_session_command(self, event: AstrMessageEvent):
         """手动结束对话会话"""
+        if not self.enable_plugin:
+            yield event.plain_result("❌ 插件未启用")
+            return
+            
         group_id = event.get_group_id()
         user_id = event.get_sender_id()
         session_key = (group_id, user_id)
@@ -403,6 +395,19 @@ class ContinuousDialoguePlugin(Star):
                 yield event.plain_result("👋 已结束连续对话")
             else:
                 yield event.plain_result("💤 您当前没有进行中的连续对话")
+
+    @filter.command("开始对话")
+    async def start_session_command(self, event: AstrMessageEvent):
+        """通过命令开启对话会话"""
+        if not self.enable_plugin:
+            yield event.plain_result("❌ 插件未启用")
+            return
+            
+        success = await self._start_user_session(event)
+        if success:
+            yield event.plain_result("🎯 已开启连续对话模式！")
+        else:
+            yield event.plain_result("❌ 开启连续对话失败")
 
     async def terminate(self):
         """插件卸载时清理资源"""
