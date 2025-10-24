@@ -3,3 +3,8 @@
 智能连续对话插件，为用户提供沉浸式对话体验
 
 自用插件，借鉴了Astrbot_plugin_Heartflow与astrbot_plugin_reply_directly
+
+# 支持
+
+[帮助文档](https://astrbot.app)
+
