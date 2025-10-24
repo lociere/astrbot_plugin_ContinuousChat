@@ -32,7 +32,6 @@ class UserSession:
 
 # 注册插件
 register(
-    ContinuousDialoguePlugin,
     "continuous_dialogue_plugin",
     "assistant",
     "智能连续对话插件，为用户提供沉浸式对话体验",
