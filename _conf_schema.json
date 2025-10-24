@@ -1,0 +1,15 @@
+{
+  "continuous_dialogue_plugin": {
+    "enable_plugin": true,           // 是否启用插件
+    "session_timeout": 300,          // 会话超时时间（秒）
+    "max_session_messages": 20,      // 最大对话轮数
+    "auto_start_on_mention": true,  // 被@时自动开启对话
+    "enable_commands": [            // 触发对话的命令列表
+      "开始对话",
+      "连续对话", 
+      "开启对话"
+    ],
+    "judgment_threshold": 0.7,      // 判断阈值（可选）
+    "max_context_length": 10        // 最大上下文长度（可选）
+  }
+}
