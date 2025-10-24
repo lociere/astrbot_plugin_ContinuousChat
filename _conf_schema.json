@@ -1,0 +1,13 @@
+{
+  "continuous_dialogue_plugin": {
+    "enable_plugin": true,
+    "session_timeout": 300,
+    "max_session_messages": 20,
+    "auto_start_on_mention": true,
+    "enable_commands": [
+      "开始对话",
+      "连续对话",
+      "开启对话"
+    ]
+  }
+}
