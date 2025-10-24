@@ -420,7 +420,7 @@ class ContinuousDialoguePlugin(Star):
 register(
     ContinuousDialoguePlugin,
     "continuous_dialogue_plugin",
-    "assistant",
+    "lociere",
     "智能连续对话插件，为用户提供沉浸式对话体验",
     "1.0.0"
 )
