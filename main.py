@@ -30,15 +30,6 @@ class UserSession:
             self.context_messages = []
 
 
-# 注册插件
-register(
-    "continuous_dialogue_plugin",
-    "assistant",
-    "智能连续对话插件，为用户提供沉浸式对话体验",
-    "1.0.0"
-)
-
-
 class ContinuousDialoguePlugin(Star):
     """连续对话插件 - 基于AstrBot插件开发规范优化"""
     
@@ -486,3 +477,12 @@ class ContinuousDialoguePlugin(Star):
                 
         logger.info("连续对话插件清理完成")
 
+
+# 注册插件
+register(
+    ContinuousDialoguePlugin,
+    "continuous_dialogue_plugin",
+    "assistant",
+    "智能连续对话插件，为用户提供沉浸式对话体验",
+    "1.0.0"
+)
