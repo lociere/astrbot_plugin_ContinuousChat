@@ -1,5 +1,5 @@
-name: astrbot_plugin_ContinuousChat # 这是你的插件的唯一识别名。
-desc: 智能连续对话插件，为用户提供沉浸式对话体验 # 插件简短描述
-version: v1.0。0 # 插件版本号。格式：v1.1.1 或者 v1.1
-author: lociere # 作者
-repo: https://github.com/lociere/astrbot_plugin_ContinuousChat # 插件的仓库地址
+name: "continuous_dialogue_plugin"
+author: "lociere"
+description: "智能连续对话插件，为用户提供沉浸式对话体验"
+version: "1.0.0"
+repository: "https://github.com/lociere/astrbot_plugin_continuous_dialogue"
