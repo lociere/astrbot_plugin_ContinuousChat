@@ -24,6 +24,7 @@ class UserSession:
     context_messages: List[Dict] = None
     timer: Optional[asyncio.TimerHandle] = None
     persona_prompt: str = ""  # 存储人格提示词
+    is_new_session: bool = True  # 新增：标记是否为新会话
     
     def __post_init__(self):
         if self.context_messages is None:
@@ -66,6 +67,39 @@ class ContinuousDialoguePlugin(Star):
         
         return bool(start_commands)
 
+    def _is_pure_command(self, event: AstrMessageEvent) -> bool:
+        """判断是否为纯指令（不包含用户消息）"""
+        message_content = event.message_str.strip()
+        
+        # 如果是@触发，检查是否有实际内容
+        if self.auto_start_on_mention and event.is_at_or_wake_command:
+            # 去掉@部分，检查剩余内容
+            at_removed = re.sub(r'@\S+\s*', '', message_content).strip()
+            return len(at_removed) == 0
+            
+        # 检查是否只包含指令
+        for cmd in self.enable_commands:
+            if message_content == cmd:
+                return True
+                
+        return False
+
+    def _extract_user_message(self, event: AstrMessageEvent) -> str:
+        """从消息中提取用户消息部分（去除指令）"""
+        message_content = event.message_str.strip()
+        
+        # 如果是@触发，去掉@部分
+        if self.auto_start_on_mention and event.is_at_or_wake_command:
+            message_content = re.sub(r'@\S+\s*', '', message_content).strip()
+        
+        # 去掉指令部分
+        for cmd in self.enable_commands:
+            if message_content.startswith(cmd):
+                message_content = message_content[len(cmd):].strip()
+                break
+                
+        return message_content
+
     async def _start_user_session(self, event: AstrMessageEvent) -> bool:
         """为用户开启沉浸式对话会话"""
         group_id = event.get_group_id()
@@ -87,7 +121,8 @@ class ContinuousDialoguePlugin(Star):
                 user_id=user_id,
                 group_id=group_id,
                 start_time=current_time,
-                last_activity=current_time
+                last_activity=current_time,
+                is_new_session=True  # 标记为新会话
             )
             
             # 设置超时定时器
@@ -236,14 +271,10 @@ class ContinuousDialoguePlugin(Star):
             logger.error(f"判断是否回复时发生错误: {e}")
             return {"should_reply": False, "reason": f"判断错误: {str(e)}", "confidence": 0.0}
 
-    async def _generate_reply(self, event: AstrMessageEvent, session: UserSession) -> str:
+    async def _generate_reply(self, event: AstrMessageEvent, session: UserSession, user_message: str) -> str:
         """生成回复内容（包含人格设定）"""
         try:
-            user_message = event.message_str
             current_context = session.context_messages.copy()
-            
-            # 添加当前用户消息到上下文
-            current_context.append({"role": "user", "content": user_message})
             
             # 使用大模型生成回复（包含人格设定）
             provider = self.context.get_using_provider()
@@ -269,7 +300,7 @@ class ContinuousDialoguePlugin(Star):
 
     async def _update_conversation_history(self, event: AstrMessageEvent, session: UserSession, 
                                          user_message: str, bot_reply: str):
-        """更新对话历史"""
+        """更新对话历史（只添加用户消息，不添加指令）"""
         try:
             # 更新会话上下文
             session.context_messages.extend([
@@ -333,12 +364,19 @@ class ContinuousDialoguePlugin(Star):
                     # 只记录日志，不发送提示消息
                     logger.info(f"为用户 {user_id} 自动开启连续对话模式")
                     
-                    # 处理当前触发消息
-                    async for result in self._handle_in_session_message(event, session_key):
-                        yield result
+                    # 检查是否为纯指令触发
+                    if self._is_pure_command(event):
+                        # 纯指令触发，不处理当前消息
+                        logger.info(f"用户 {user_id} 通过纯指令触发连续对话，不处理当前消息")
+                        return
+                    else:
+                        # 非纯指令触发，处理当前消息
+                        logger.info(f"用户 {user_id} 通过消息触发连续对话，处理当前消息")
+                        async for result in self._handle_in_session_message(event, session_key, is_first_message=True):
+                            yield result
 
-    async def _handle_in_session_message(self, event: AstrMessageEvent, session_key: Tuple[str, str]):
-        """处理会话中的消息 - 修复：使用异步生成器"""
+    async def _handle_in_session_message(self, event: AstrMessageEvent, session_key: Tuple[str, str], is_first_message: bool = False):
+        """处理会话中的消息"""
         group_id = event.get_group_id()
         user_id = event.get_sender_id()
         user_message = event.message_str.strip()
@@ -367,6 +405,15 @@ class ContinuousDialoguePlugin(Star):
                 lambda: asyncio.create_task(self._handle_session_timeout(session_key))
             )
         
+        # 提取用户消息（去除指令部分）
+        extracted_message = self._extract_user_message(event)
+        
+        # 如果是新会话的第一条消息且是纯指令触发，不进行判断和回复
+        if is_first_message and session.is_new_session and self._is_pure_command(event):
+            logger.info(f"新会话第一条消息为纯指令，不进行回复判断")
+            session.is_new_session = False  # 标记会话已不是新会话
+            return
+        
         # 使用大模型判断是否回复
         judgment_result = await self._judge_should_reply(event, session)
         
@@ -375,7 +422,7 @@ class ContinuousDialoguePlugin(Star):
         
         if judgment_result["should_reply"]:
             # 生成并发送回复
-            bot_reply = await self._generate_reply(event, session)
+            bot_reply = await self._generate_reply(event, session, extracted_message)
             
             # 使用消息链构建更丰富的回复
             reply_chain = [
@@ -384,8 +431,12 @@ class ContinuousDialoguePlugin(Star):
             
             yield event.chain_result(reply_chain)
             
-            # 更新对话历史
-            await self._update_conversation_history(event, session, user_message, bot_reply)
+            # 更新对话历史（只添加用户消息部分）
+            if extracted_message:  # 确保有实际用户消息才添加到历史
+                await self._update_conversation_history(event, session, extracted_message, bot_reply)
+            
+            # 标记会话已不是新会话
+            session.is_new_session = False
         else:
             # 不回复，检查是否需要结束会话
             confidence = judgment_result.get("confidence", 0)
