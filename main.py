@@ -23,6 +23,7 @@ class UserSession:
     message_count: int = 0
     context_messages: List[Dict] = None
     timer: Optional[asyncio.TimerHandle] = None
+    persona_prompt: str = ""  # 新增：存储人格提示词
     
     def __post_init__(self):
         if self.context_messages is None:
@@ -37,6 +38,7 @@ register(
     "智能连续对话插件，为用户提供沉浸式对话体验",
     "1.0.0"
 )
+
 
 class ContinuousDialoguePlugin(Star):
     """连续对话插件 - 基于AstrBot插件开发规范优化"""
@@ -104,6 +106,9 @@ class ContinuousDialoguePlugin(Star):
                 lambda: asyncio.create_task(self._handle_session_timeout(session_key))
             )
             
+            # 获取当前人格提示词
+            session.persona_prompt = await self._get_persona_prompt(event)
+            
             self.user_sessions[session_key] = session
             
             # 获取对话历史作为上下文
@@ -111,6 +116,44 @@ class ContinuousDialoguePlugin(Star):
             
             logger.info(f"为用户 {user_id} 开启沉浸式对话会话，超时时间: {self.session_timeout}秒")
             return True
+
+    async def _get_persona_prompt(self, event: AstrMessageEvent) -> str:
+        """获取当前对话的人格提示词"""
+        try:
+            # 获取当前对话
+            uid = event.unified_msg_origin
+            curr_cid = await self.context.conversation_manager.get_curr_conversation_id(uid)
+            if not curr_cid:
+                return ""
+                
+            conversation = await self.context.conversation_manager.get_conversation(uid, curr_cid)
+            if not conversation:
+                return ""
+                
+            # 获取人格ID
+            persona_id = conversation.persona_id
+            
+            # 处理特殊值
+            if persona_id == "[%None]":  # 用户显式取消人格
+                return ""
+                
+            if not persona_id:  # 如果为None，使用默认人格
+                default_persona = self.context.provider_manager.selected_default_persona
+                persona_id = default_persona.get("name") if default_persona else ""
+                
+            if not persona_id:
+                return ""
+                
+            # 从人格列表中查找对应的人格
+            for persona in self.context.provider_manager.personas:
+                if persona.get("name") == persona_id:
+                    return persona.get("prompt", "")
+                    
+            return ""
+            
+        except Exception as e:
+            logger.error(f"获取人格提示词失败: {e}")
+            return ""
 
     async def _close_user_session(self, session_key: Tuple[str, str]):
         """关闭用户会话"""
@@ -152,9 +195,12 @@ class ContinuousDialoguePlugin(Star):
             user_message = event.message_str
             current_context = session.context_messages.copy()
             
-            # 构建判断提示词
+            # 构建判断提示词（包含人格信息）
             judgment_prompt = f"""
 你正在与用户进行连续对话。请判断是否应该回复用户的最新消息。
+
+## 机器人角色设定：
+{session.persona_prompt if session.persona_prompt else "默认角色：智能助手"}
 
 ## 对话历史（最近{len(current_context)}条）：
 {json.dumps(current_context, ensure_ascii=False, indent=2) if current_context else "无历史记录"}
@@ -163,7 +209,7 @@ class ContinuousDialoguePlugin(Star):
 {user_message}
 
 ## 判断要求：
-请分析用户的意图和对话的连贯性，判断是否需要回复。
+请基于上述机器人角色设定，分析用户的意图和对话的连贯性，判断是否需要回复。
 
 请以JSON格式回复：
 {{
@@ -201,7 +247,7 @@ class ContinuousDialoguePlugin(Star):
             return {"should_reply": False, "reason": f"判断错误: {str(e)}", "confidence": 0.0}
 
     async def _generate_reply(self, event: AstrMessageEvent, session: UserSession) -> str:
-        """生成回复内容"""
+        """生成回复内容（包含人格设定）"""
         try:
             user_message = event.message_str
             current_context = session.context_messages.copy()
@@ -209,14 +255,20 @@ class ContinuousDialoguePlugin(Star):
             # 添加当前用户消息到上下文
             current_context.append({"role": "user", "content": user_message})
             
-            # 使用大模型生成回复
+            # 使用大模型生成回复（包含人格设定）
             provider = self.context.get_using_provider()
             if not provider:
                 return "抱歉，我现在无法回复您。"
             
+            # 构建系统提示词（包含人格设定）
+            system_prompt = ""
+            if session.persona_prompt:
+                system_prompt = f"你是一个AI助手，请按照以下角色设定进行回复：\n\n{session.persona_prompt}"
+            
             llm_response = await provider.text_chat(
                 prompt=user_message,
-                contexts=current_context
+                contexts=current_context,
+                system_prompt=system_prompt
             )
             
             return llm_response.completion_text.strip()
@@ -371,9 +423,19 @@ class ContinuousDialoguePlugin(Star):
             if in_session:
                 session = self.user_sessions[session_key]
                 duration = int(time.time() - session.start_time)
+                
+                # 获取人格名称
+                persona_name = "默认人格"
+                if session.persona_prompt:
+                    # 尝试从人格提示词中提取人格名称
+                    match = re.search(r"(?:名称|名字|角色)[:：]\s*([^\n]+)", session.persona_prompt)
+                    if match:
+                        persona_name = match.group(1).strip()
+                
                 status_info = f"""
 🔮 连续对话状态
 ├── 状态: 🟢 进行中
+├── 人格: {persona_name}
 ├── 持续时间: {duration}秒
 ├── 消息数量: {session.message_count}条
 ├── 最后活动: {int(time.time() - session.last_activity)}秒前
@@ -424,3 +486,4 @@ class ContinuousDialoguePlugin(Star):
                 await self._close_user_session(session_key)
                 
         logger.info("连续对话插件清理完成")
+
