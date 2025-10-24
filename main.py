@@ -284,7 +284,7 @@ class ContinuousDialoguePlugin(Star):
             # 构建系统提示词（包含人格设定）
             system_prompt = ""
             if session.persona_prompt:
-                system_prompt = f"你是一个聊天机器人，请严格按照以下角色设定进行回复：\n\n{session.persona_prompt}"
+                system_prompt = f"请严格按照以下角色设定进行回复：\n\n{session.persona_prompt}"
             
             llm_response = await provider.text_chat(
                 prompt=user_message,
