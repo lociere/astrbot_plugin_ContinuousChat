@@ -1,9 +1,5 @@
-# helloworld
+# Continuous_Dialogue
 
-AstrBot 插件模板
+智能连续对话插件，为用户提供沉浸式对话体验
 
-A template plugin for AstrBot plugin feature
-
-# 支持
-
-[帮助文档](https://astrbot.app)
+自用插件，借鉴了Astrbot_plugin_Heartflow与astrbot_plugin_reply_directly
