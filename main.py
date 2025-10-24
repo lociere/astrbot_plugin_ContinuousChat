@@ -29,7 +29,6 @@ class UserSession:
             self.context_messages = []
 
 
-# 修复：确保插件类在模块顶层定义
 class ContinuousDialoguePlugin(Star):
     """连续对话插件 - 基于AstrBot插件开发规范优化"""
     
@@ -273,7 +272,8 @@ class ContinuousDialoguePlugin(Star):
         
         if in_session:
             # 处理沉浸式对话中的消息
-            await self._handle_in_session_message(event, session_key)
+            async for result in self._handle_in_session_message(event, session_key):
+                yield result
         else:
             # 检查是否应该开始新会话
             if self._should_start_session(event):
@@ -284,10 +284,11 @@ class ContinuousDialoguePlugin(Star):
                     yield event.plain_result(start_msg)
                     
                     # 处理当前触发消息
-                    await self._handle_in_session_message(event, session_key)
+                    async for result in self._handle_in_session_message(event, session_key):
+                        yield result
 
     async def _handle_in_session_message(self, event: AstrMessageEvent, session_key: Tuple[str, str]):
-        """处理会话中的消息"""
+        """处理会话中的消息 - 修复：使用异步生成器"""
         group_id = event.get_group_id()
         user_id = event.get_sender_id()
         user_message = event.message_str.strip()
@@ -416,11 +417,11 @@ class ContinuousDialoguePlugin(Star):
         logger.info("连续对话插件清理完成")
 
 
-# 修复：确保插件类被正确注册
+# 注册插件
 register(
     ContinuousDialoguePlugin,
     "continuous_dialogue_plugin",
-    "lociere",
+    "assistant",
     "智能连续对话插件，为用户提供沉浸式对话体验",
     "1.0.0"
 )
