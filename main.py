@@ -12,6 +12,13 @@ from astrbot.api.star import Star, register
 from astrbot.api import logger
 
 
+@register( "astrbot_plugin_ContinuousChat",
+            "lociere",
+            "智能连续对话插件，为用户提供沉浸式对话体验",
+            "1.0.0",
+            "https://github.com/lociere/astrbot_plugin_continuous_dialogue")
+
+
 @dataclass
 class UserSession:
     """用户沉浸式对话会话数据"""
@@ -28,13 +35,7 @@ class UserSession:
             self.context_messages = []
 
 
-@register(
-    "astrbot_plugin_ContinuousChat",
-    "lociere",
-    "智能连续对话插件，为用户提供沉浸式对话体验",
-    "1.0.0",
-    "https://github.com/lociere/astrbot_plugin_continuous_dialogue"
-)
+
 class ContinuousDialoguePlugin(Star):
     """连续对话插件"""
     
