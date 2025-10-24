@@ -33,6 +33,7 @@ class UserSession:
     "lociere",
     "智能连续对话插件，为用户提供沉浸式对话体验",
     "1.0.0",
+    "https://github.com/lociere/astrbot_plugin_continuous_dialogue"
 )
 class ContinuousDialoguePlugin(Star):
     """连续对话插件"""
