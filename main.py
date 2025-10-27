@@ -2,15 +2,85 @@ import asyncio
 import json
 import re
 import time
-from typing import Dict, Tuple, Optional, List
-from dataclasses import dataclass
+import os
+import pickle
+from typing import Dict, Tuple, Optional, List, Any
+from dataclasses import dataclass, asdict
 from asyncio import Lock
+from datetime import datetime
 
 import astrbot.api.message_components as Comp
 from astrbot.api.event import AstrMessageEvent, filter, MessageEventResult
 from astrbot.api.star import Star, register, Context
 from astrbot.api import logger
 from astrbot.core.conversation_mgr import Conversation
+
+
+@dataclass
+class ChatHistoryRecord:
+    """单条聊天记录"""
+    timestamp: float
+    role: str  # 'user' 或 'assistant'
+    content: str
+    message_type: str = 'text'
+    metadata: Dict[str, Any] = None
+    
+    def __post_init__(self):
+        if self.metadata is None:
+            self.metadata = {}
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'ChatHistoryRecord':
+        return cls(**data)
+
+
+@dataclass
+class UserChatHistory:
+    """用户聊天历史记录"""
+    user_id: str
+    group_id: str
+    records: List[ChatHistoryRecord]
+    last_updated: float
+    total_messages: int = 0
+    
+    def __post_init__(self):
+        if self.records is None:
+            self.records = []
+    
+    def add_record(self, record: ChatHistoryRecord):
+        self.records.append(record)
+        self.last_updated = time.time()
+        self.total_messages += 1
+    
+    def get_recent_records(self, count: int) -> List[ChatHistoryRecord]:
+        return self.records[-count:] if self.records else []
+    
+    def clear_old_records(self, max_records: int):
+        if len(self.records) > max_records:
+            self.records = self.records[-max_records:]
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'user_id': self.user_id,
+            'group_id': self.group_id,
+            'records': [r.to_dict() for r in self.records],
+            'last_updated': self.last_updated,
+            'total_messages': self.total_messages
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'UserChatHistory':
+        records = [ChatHistoryRecord.from_dict(r) for r in data.get('records', [])]
+        return cls(
+            user_id=data['user_id'],
+            group_id=data['group_id'],
+            records=records,
+            last_updated=data['last_updated'],
+            total_messages=data.get('total_messages', 0)
+        )
 
 
 @dataclass
@@ -23,22 +93,29 @@ class UserSession:
     message_count: int = 0
     context_messages: List[Dict] = None
     timer: Optional[asyncio.TimerHandle] = None
-    persona_prompt: str = ""  # 存储人格提示词
-    is_new_session: bool = True  # 新增：标记是否为新会话
+    persona_prompt: str = ""
+    is_new_session: bool = True
+    history_records_used: int = 0
     
     def __post_init__(self):
         if self.context_messages is None:
             self.context_messages = []
 
 
+@register(
+    "continuous_dialogue",
+    "assistant",
+    "连续对话插件，支持历史记录存储和智能角色设定调用",
+    "1.0.0"
+)
 class ContinuousDialoguePlugin(Star):
-    """连续对话插件 - 基于AstrBot插件开发规范优化"""
+    """增强版连续对话插件"""
     
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
         self.config = config
         
-        # 从配置中读取参数
+        # 基础配置
         self.enable_plugin = self.config.get("enable_plugin", True)
         self.session_timeout = self.config.get("session_timeout", 300)
         self.max_session_messages = self.config.get("max_session_messages", 20)
@@ -46,59 +123,190 @@ class ContinuousDialoguePlugin(Star):
         self.judgment_threshold = self.config.get("judgment_threshold", 0.7)
         self.enable_commands = self.config.get("enable_commands", ["开始对话", "连续对话", "开启对话"])
         
+        # 历史记录配置
+        self.enable_history_storage = self.config.get("enable_history_storage", True)
+        self.max_history_records = self.config.get("max_history_records", 100)
+        self.history_records_to_use = self.config.get("history_records_to_use", 10)
+        self.history_storage_path = self.config.get("history_storage_path", "data/continuous_dialogue_history")
+        
+        # 角色设定配置
+        self.enable_persona = self.config.get("enable_persona", True)
+        self.use_system_prompt_directly = self.config.get("use_system_prompt_directly", True)
+        self.persona_override = self.config.get("persona_override", "")
+        
         # 会话管理
         self.user_sessions: Dict[Tuple[str, str], UserSession] = {}
         self.session_lock = Lock()
         
-        logger.info("连续对话插件初始化完成")
-
-    def _should_start_session(self, event: AstrMessageEvent) -> bool:
-        """判断是否应该开始沉浸式对话"""
-        if not self.enable_plugin:
-            return False
-            
-        # 检查是否被@（如果启用）
-        if self.auto_start_on_mention and event.is_at_or_wake_command:
-            return True
-            
-        # 检查是否包含开始命令
-        message_content = event.message_str.strip()
-        start_commands = [cmd for cmd in self.enable_commands if cmd in message_content]
+        # 历史记录管理
+        self.chat_histories: Dict[Tuple[str, str], UserChatHistory] = {}
+        self.history_lock = Lock()
         
-        return bool(start_commands)
-
-    def _is_pure_command(self, event: AstrMessageEvent) -> bool:
-        """判断是否为纯指令（不包含用户消息）"""
-        message_content = event.message_str.strip()
+        # 创建存储目录
+        if self.enable_history_storage:
+            os.makedirs(self.history_storage_path, exist_ok=True)
+            asyncio.create_task(self._load_all_histories())
         
-        # 如果是@触发，检查是否有实际内容
-        if self.auto_start_on_mention and event.is_at_or_wake_command:
-            # 去掉@部分，检查剩余内容
-            at_removed = re.sub(r'@\S+\s*', '', message_content).strip()
-            return len(at_removed) == 0
-            
-        # 检查是否只包含指令
-        for cmd in self.enable_commands:
-            if message_content == cmd:
-                return True
+        logger.info("增强版连续对话插件初始化完成")
+
+    async def _load_all_histories(self):
+        """加载所有历史记录"""
+        try:
+            if not os.path.exists(self.history_storage_path):
+                return
                 
-        return False
+            history_files = [f for f in os.listdir(self.history_storage_path) if f.endswith('.pkl')]
+            loaded_count = 0
+            
+            for filename in history_files:
+                try:
+                    filepath = os.path.join(self.history_storage_path, filename)
+                    with open(filepath, 'rb') as f:
+                        history_data = pickle.load(f)
+                    
+                    user_history = UserChatHistory.from_dict(history_data)
+                    session_key = (user_history.group_id, user_history.user_id)
+                    self.chat_histories[session_key] = user_history
+                    loaded_count += 1
+                    
+                except Exception as e:
+                    logger.error(f"加载历史记录文件 {filename} 失败: {e}")
+            
+            logger.info(f"成功加载 {loaded_count} 个用户的历史记录")
+            
+        except Exception as e:
+            logger.error(f"加载历史记录失败: {e}")
 
-    def _extract_user_message(self, event: AstrMessageEvent) -> str:
-        """从消息中提取用户消息部分（去除指令）"""
-        message_content = event.message_str.strip()
-        
-        # 如果是@触发，去掉@部分
-        if self.auto_start_on_mention and event.is_at_or_wake_command:
-            message_content = re.sub(r'@\S+\s*', '', message_content).strip()
-        
-        # 去掉指令部分
-        for cmd in self.enable_commands:
-            if message_content.startswith(cmd):
-                message_content = message_content[len(cmd):].strip()
-                break
+    async def _save_user_history(self, user_history: UserChatHistory):
+        """保存用户历史记录"""
+        if not self.enable_history_storage:
+            return
+            
+        try:
+            filename = f"{user_history.group_id}_{user_history.user_id}.pkl"
+            filepath = os.path.join(self.history_storage_path, filename)
+            
+            user_history.clear_old_records(self.max_history_records)
+            
+            with open(filepath, 'wb') as f:
+                pickle.dump(user_history.to_dict(), f)
                 
-        return message_content
+        except Exception as e:
+            logger.error(f"保存用户历史记录失败: {e}")
+
+    def _get_user_history(self, group_id: str, user_id: str) -> UserChatHistory:
+        """获取用户历史记录"""
+        session_key = (group_id, user_id)
+        
+        if session_key not in self.chat_histories:
+            self.chat_histories[session_key] = UserChatHistory(
+                user_id=user_id,
+                group_id=group_id,
+                records=[],
+                last_updated=time.time()
+            )
+        
+        return self.chat_histories[session_key]
+
+    async def _add_message_to_history(self, group_id: str, user_id: str, role: str, content: str):
+        """添加消息到历史记录"""
+        if not self.enable_history_storage:
+            return
+            
+        async with self.history_lock:
+            user_history = self._get_user_history(group_id, user_id)
+            
+            record = ChatHistoryRecord(
+                timestamp=time.time(),
+                role=role,
+                content=content
+            )
+            
+            user_history.add_record(record)
+            await self._save_user_history(user_history)
+
+    async def _get_recent_history_for_session(self, group_id: str, user_id: str) -> List[Dict[str, Any]]:
+        """获取用于会话的最近历史记录"""
+        if not self.enable_history_storage:
+            return []
+            
+        async with self.history_lock:
+            user_history = self._get_user_history(group_id, user_id)
+            recent_records = user_history.get_recent_records(self.history_records_to_use)
+            
+            context_messages = []
+            for record in recent_records:
+                context_messages.append({
+                    "role": record.role,
+                    "content": record.content
+                })
+            
+            return context_messages
+
+    async def _get_enhanced_persona_prompt(self, event: AstrMessageEvent) -> str:
+        """获取增强版角色设定"""
+        if not self.enable_persona:
+            return ""
+        
+        if self.persona_override:
+            return self.persona_override
+        
+        try:
+            uid = event.unified_msg_origin
+            curr_cid = await self.context.conversation_manager.get_curr_conversation_id(uid)
+            if not curr_cid:
+                return ""
+                
+            conversation = await self.context.conversation_manager.get_conversation(uid, curr_cid)
+            if not conversation:
+                return ""
+            
+            if self.use_system_prompt_directly:
+                return await self._get_system_prompt_directly(conversation)
+            else:
+                persona_id = conversation.persona_id
+                
+                if persona_id == "[%None]":
+                    return ""
+                    
+                if not persona_id:
+                    default_persona = self.context.provider_manager.selected_default_persona
+                    persona_id = default_persona.get("name") if default_persona else ""
+                
+                return await self._get_persona_prompt_by_id(persona_id)
+                
+        except Exception as e:
+            logger.error(f"获取角色设定失败: {e}")
+            return ""
+
+    async def _get_system_prompt_directly(self, conversation: Conversation) -> str:
+        """直接获取系统提示词"""
+        try:
+            if conversation.history:
+                history_data = json.loads(conversation.history)
+                for msg in history_data:
+                    if msg.get("role") == "system":
+                        return msg.get("content", "")
+            
+            if conversation.persona_id and conversation.persona_id != "[%None]":
+                return await self._get_persona_prompt_by_id(conversation.persona_id)
+            
+            return ""
+            
+        except Exception as e:
+            logger.error(f"直接获取系统提示词失败: {e}")
+            return ""
+
+    async def _get_persona_prompt_by_id(self, persona_id: str) -> str:
+        """根据角色ID获取提示词"""
+        try:
+            for persona in self.context.provider_manager.personas:
+                if persona.get("name") == persona_id:
+                    return persona.get("prompt", "")
+            return ""
+        except Exception as e:
+            logger.error(f"根据ID获取角色设定失败: {e}")
+            return ""
 
     async def _start_user_session(self, event: AstrMessageEvent) -> bool:
         """为用户开启沉浸式对话会话"""
@@ -111,91 +319,36 @@ class ContinuousDialoguePlugin(Star):
         session_key = (group_id, user_id)
         
         async with self.session_lock:
-            # 如果已存在会话，先关闭
             if session_key in self.user_sessions:
                 await self._close_user_session(session_key)
             
-            # 创建新会话
             current_time = time.time()
             session = UserSession(
                 user_id=user_id,
                 group_id=group_id,
                 start_time=current_time,
                 last_activity=current_time,
-                is_new_session=True  # 标记为新会话
+                is_new_session=True
             )
             
-            # 设置超时定时器
+            session.persona_prompt = await self._get_enhanced_persona_prompt(event)
+            
             session.timer = asyncio.get_event_loop().call_later(
                 self.session_timeout,
                 lambda: asyncio.create_task(self._handle_session_timeout(session_key))
             )
             
-            # 获取当前人格提示词
-            session.persona_prompt = await self._get_persona_prompt(event)
+            if self.enable_history_storage:
+                history_context = await self._get_recent_history_for_session(group_id, user_id)
+                session.context_messages = history_context
+                session.history_records_used = len(history_context)
+            else:
+                await self._load_conversation_context(event, session)
             
             self.user_sessions[session_key] = session
             
-            # 获取对话历史作为上下文
-            await self._load_conversation_context(event, session)
-            
-            logger.info(f"为用户 {user_id} 开启沉浸式对话会话，超时时间: {self.session_timeout}秒")
+            logger.info(f"为用户 {user_id} 开启沉浸式对话会话")
             return True
-
-    async def _get_persona_prompt(self, event: AstrMessageEvent) -> str:
-        """获取当前对话的人格提示词"""
-        try:
-            # 获取当前对话
-            uid = event.unified_msg_origin
-            curr_cid = await self.context.conversation_manager.get_curr_conversation_id(uid)
-            if not curr_cid:
-                return ""
-                
-            conversation = await self.context.conversation_manager.get_conversation(uid, curr_cid)
-            if not conversation:
-                return ""
-                
-            # 获取人格ID
-            persona_id = conversation.persona_id
-            
-            # 处理特殊值
-            if persona_id == "[%None]":  # 用户显式取消人格
-                return ""
-                
-            if not persona_id:  # 如果为None，使用默认人格
-                default_persona = self.context.provider_manager.selected_default_persona
-                persona_id = default_persona.get("name") if default_persona else ""
-                
-            if not persona_id:
-                return ""
-                
-            # 从人格列表中查找对应的人格
-            for persona in self.context.provider_manager.personas:
-                if persona.get("name") == persona_id:
-                    return persona.get("prompt", "")
-                    
-            return ""
-            
-        except Exception as e:
-            logger.error(f"获取人格提示词失败: {e}")
-            return ""
-
-    async def _close_user_session(self, session_key: Tuple[str, str]):
-        """关闭用户会话"""
-        if session_key in self.user_sessions:
-            session = self.user_sessions[session_key]
-            if session.timer:
-                session.timer.cancel()
-            del self.user_sessions[session_key]
-            logger.info(f"关闭用户 {session_key[1]} 的沉浸式对话会话")
-
-    async def _handle_session_timeout(self, session_key: Tuple[str, str]):
-        """处理会话超时"""
-        async with self.session_lock:
-            if session_key in self.user_sessions:
-                session = self.user_sessions[session_key]
-                logger.info(f"用户 {session_key[1]} 的会话已超时，自动关闭")
-                await self._close_user_session(session_key)
 
     async def _load_conversation_context(self, event: AstrMessageEvent, session: UserSession):
         """加载对话历史上下文"""
@@ -208,11 +361,26 @@ class ContinuousDialoguePlugin(Star):
             conversation = await self.context.conversation_manager.get_conversation(uid, curr_cid)
             if conversation and conversation.history:
                 history_data = json.loads(conversation.history)
-                # 只保留最近的几条消息作为上下文
-                session.context_messages = history_data[-5:]  # 最近5条消息
+                session.context_messages = history_data[-5:]
+                session.history_records_used = len(session.context_messages)
                 
         except Exception as e:
             logger.error(f"加载对话上下文失败: {e}")
+
+    async def _close_user_session(self, session_key: Tuple[str, str]):
+        """关闭用户会话"""
+        if session_key in self.user_sessions:
+            session = self.user_sessions[session_key]
+            if session.timer:
+                session.timer.cancel()
+            del self.user_sessions[session_key]
+
+    async def _handle_session_timeout(self, session_key: Tuple[str, str]):
+        """处理会话超时"""
+        async with self.session_lock:
+            if session_key in self.user_sessions:
+                logger.info(f"会话已超时，自动关闭")
+                await self._close_user_session(session_key)
 
     async def _judge_should_reply(self, event: AstrMessageEvent, session: UserSession) -> dict:
         """使用大模型判断是否应该回复"""
@@ -220,51 +388,39 @@ class ContinuousDialoguePlugin(Star):
             user_message = event.message_str
             current_context = session.context_messages.copy()
             
-            # 构建判断提示词（包含人格信息）
             judgment_prompt = f"""
-你正在与用户进行连续对话。请判断是否应该回复用户的最新消息。
+请分析当前对话情况，判断是否需要回复用户的消息。
 
-## 机器人角色设定：
-{session.persona_prompt if session.persona_prompt else "默认角色：智能助手"}
+## 角色设定：
+{session.persona_prompt if session.persona_prompt else "默认助手角色"}
 
-## 对话历史（最近{len(current_context)}条）：
+## 最近对话记录（{len(current_context)}条）：
 {json.dumps(current_context, ensure_ascii=False, indent=2) if current_context else "无历史记录"}
 
 ## 用户最新消息：
 {user_message}
 
-## 判断要求：
-请基于上述机器人角色设定，分析用户的意图和对话的连贯性，判断是否需要回复。
+请基于角色设定和对话历史，分析用户意图和对话连贯性，判断是否需要回应。
 
 请以JSON格式回复：
 {{
     "should_reply": true/false,
-    "reason": "判断理由的详细说明",
+    "reason": "判断理由",
     "confidence": 0.0-1.0的置信度
 }}
-
-**重要：必须返回纯JSON格式，不要包含其他内容！**
 """
             
             provider = self.context.get_using_provider()
             if not provider:
                 return {"should_reply": False, "reason": "无可用大模型", "confidence": 0.0}
             
-            # 调用大模型进行判断
-            llm_response = await provider.text_chat(
-                prompt=judgment_prompt,
-                contexts=[]  # 不使用额外上下文
-            )
-            
+            llm_response = await provider.text_chat(prompt=judgment_prompt, contexts=[])
             response_text = llm_response.completion_text.strip()
             
-            # 提取JSON
             json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
             if json_match:
-                judgment_data = json.loads(json_match.group())
-                return judgment_data
+                return json.loads(json_match.group())
             else:
-                logger.warning(f"大模型返回格式异常: {response_text}")
                 return {"should_reply": False, "reason": "响应格式错误", "confidence": 0.0}
                 
         except Exception as e:
@@ -272,19 +428,17 @@ class ContinuousDialoguePlugin(Star):
             return {"should_reply": False, "reason": f"判断错误: {str(e)}", "confidence": 0.0}
 
     async def _generate_reply(self, event: AstrMessageEvent, session: UserSession, user_message: str) -> str:
-        """生成回复内容（包含人格设定）"""
+        """生成回复内容"""
         try:
             current_context = session.context_messages.copy()
-            
-            # 使用大模型生成回复（包含人格设定）
             provider = self.context.get_using_provider()
+            
             if not provider:
                 return "抱歉，我现在无法回复您。"
             
-            # 构建系统提示词（包含人格设定）
             system_prompt = ""
             if session.persona_prompt:
-                system_prompt = f"请严格按照以下角色设定进行回复：\n\n{session.persona_prompt}"
+                system_prompt = f"请按照以下角色设定进行回复：\n\n{session.persona_prompt}"
             
             llm_response = await provider.text_chat(
                 prompt=user_message,
@@ -298,82 +452,36 @@ class ContinuousDialoguePlugin(Star):
             logger.error(f"生成回复时发生错误: {e}")
             return "抱歉，我暂时无法处理您的消息。"
 
-    async def _update_conversation_history(self, event: AstrMessageEvent, session: UserSession, 
-                                         user_message: str, bot_reply: str):
-        """更新对话历史（只添加用户消息，不添加指令）"""
-        try:
-            # 更新会话上下文
-            session.context_messages.extend([
-                {"role": "user", "content": user_message},
-                {"role": "assistant", "content": bot_reply}
-            ])
-            
-            # 限制上下文长度
-            if len(session.context_messages) > self.max_session_messages * 2:
-                session.context_messages = session.context_messages[-self.max_session_messages * 2:]
-                
-            # 更新到对话管理器
-            uid = event.unified_msg_origin
-            curr_cid = await self.context.conversation_manager.get_curr_conversation_id(uid)
-            if curr_cid:
-                conversation = await self.context.conversation_manager.get_conversation(uid, curr_cid)
-                if conversation:
-                    # 合并历史记录
-                    try:
-                        existing_history = json.loads(conversation.history) if conversation.history else []
-                        updated_history = existing_history + [
-                            {"role": "user", "content": user_message},
-                            {"role": "assistant", "content": bot_reply}
-                        ]
-                        conversation.history = json.dumps(updated_history, ensure_ascii=False)
-                        await self.context.conversation_manager.update_conversation(uid, curr_cid, updated_history)
-                    except Exception as e:
-                        logger.error(f"更新对话历史失败: {e}")
-                        
-        except Exception as e:
-            logger.error(f"更新对话历史时发生错误: {e}")
-
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_group_message(self, event: AstrMessageEvent):
-        """处理群消息 - 使用事件监听器"""
+        """处理群消息"""
         if not self.enable_plugin:
             return
             
         group_id = event.get_group_id()
         user_id = event.get_sender_id()
         
-        # 跳过机器人自己的消息
         if user_id == event.get_self_id():
             return
             
         session_key = (group_id, user_id)
         
-        # 检查是否在沉浸式对话中
         async with self.session_lock:
             in_session = session_key in self.user_sessions
         
         if in_session:
-            # 处理沉浸式对话中的消息
             async for result in self._handle_in_session_message(event, session_key):
                 yield result
         else:
-            # 检查是否应该开始新会话
             if self._should_start_session(event):
                 success = await self._start_user_session(event)
                 if success:
-                    # 只记录日志，不发送提示消息
-                    logger.info(f"为用户 {user_id} 自动开启连续对话模式")
-                    
-                    # 检查是否为纯指令触发
-                    if self._is_pure_command(event):
-                        # 纯指令触发，不处理当前消息
-                        logger.info(f"用户 {user_id} 通过纯指令触发连续对话，不处理当前消息")
-                        return
-                    else:
-                        # 非纯指令触发，处理当前消息
-                        logger.info(f"用户 {user_id} 通过消息触发连续对话，处理当前消息")
+                    if not self._is_pure_command(event):
                         async for result in self._handle_in_session_message(event, session_key, is_first_message=True):
                             yield result
+
+        if self.enable_history_storage and not self._is_pure_command(event):
+            await self._add_message_to_history(group_id, user_id, 'user', event.message_str)
 
     async def _handle_in_session_message(self, event: AstrMessageEvent, session_key: Tuple[str, str], is_first_message: bool = False):
         """处理会话中的消息"""
@@ -381,11 +489,9 @@ class ContinuousDialoguePlugin(Star):
         user_id = event.get_sender_id()
         user_message = event.message_str.strip()
         
-        # 检查结束命令
         if any(end_cmd in user_message for end_cmd in ["结束对话", "退出对话", "结束"]):
             async with self.session_lock:
                 await self._close_user_session(session_key)
-            # 只记录日志，不发送提示消息
             logger.info(f"用户 {user_id} 结束连续对话")
             return
         
@@ -397,7 +503,6 @@ class ContinuousDialoguePlugin(Star):
             session.last_activity = time.time()
             session.message_count += 1
             
-            # 重置超时定时器
             if session.timer:
                 session.timer.cancel()
             session.timer = asyncio.get_event_loop().call_later(
@@ -405,48 +510,69 @@ class ContinuousDialoguePlugin(Star):
                 lambda: asyncio.create_task(self._handle_session_timeout(session_key))
             )
         
-        # 提取用户消息（去除指令部分）
         extracted_message = self._extract_user_message(event)
         
-        # 如果是新会话的第一条消息且是纯指令触发，不进行判断和回复
         if is_first_message and session.is_new_session and self._is_pure_command(event):
-            logger.info(f"新会话第一条消息为纯指令，不进行回复判断")
-            session.is_new_session = False  # 标记会话已不是新会话
+            session.is_new_session = False
             return
         
-        # 使用大模型判断是否回复
         judgment_result = await self._judge_should_reply(event, session)
         
-        logger.info(f"连续对话判断结果 - 用户: {user_id}, 回复: {judgment_result['should_reply']}, "
-                   f"置信度: {judgment_result.get('confidence', 0):.2f}")
-        
         if judgment_result["should_reply"]:
-            # 生成并发送回复
             bot_reply = await self._generate_reply(event, session, extracted_message)
             
-            # 使用消息链构建更丰富的回复
-            reply_chain = [
-                Comp.Plain(text=bot_reply)
-            ]
-            
+            reply_chain = [Comp.Plain(text=bot_reply)]
             yield event.chain_result(reply_chain)
             
-            # 更新对话历史（只添加用户消息部分）
-            if extracted_message:  # 确保有实际用户消息才添加到历史
-                await self._update_conversation_history(event, session, extracted_message, bot_reply)
+            if extracted_message and self.enable_history_storage:
+                await self._add_message_to_history(group_id, user_id, 'assistant', bot_reply)
             
-            # 标记会话已不是新会话
             session.is_new_session = False
         else:
-            # 不回复，检查是否需要结束会话
             confidence = judgment_result.get("confidence", 0)
             if confidence > self.judgment_threshold:
                 async with self.session_lock:
                     await self._close_user_session(session_key)
+
+    def _should_start_session(self, event: AstrMessageEvent) -> bool:
+        """判断是否应该开始沉浸式对话"""
+        if not self.enable_plugin:
+            return False
+            
+        if self.auto_start_on_mention and event.is_at_or_wake_command:
+            return True
+            
+        message_content = event.message_str.strip()
+        start_commands = [cmd for cmd in self.enable_commands if cmd in message_content]
+        return bool(start_commands)
+
+    def _is_pure_command(self, event: AstrMessageEvent) -> bool:
+        """判断是否为纯指令"""
+        message_content = event.message_str.strip()
+        
+        if self.auto_start_on_mention and event.is_at_or_wake_command:
+            at_removed = re.sub(r'@\S+\s*', '', message_content).strip()
+            return len(at_removed) == 0
+            
+        for cmd in self.enable_commands:
+            if message_content == cmd:
+                return True
                 
-                # 只记录日志，不发送提示消息
-                end_reason = judgment_result.get("reason", "对话自然结束")
-                logger.info(f"用户 {user_id} 的连续对话已自动结束，原因: {end_reason}")
+        return False
+
+    def _extract_user_message(self, event: AstrMessageEvent) -> str:
+        """从消息中提取用户消息部分"""
+        message_content = event.message_str.strip()
+        
+        if self.auto_start_on_mention and event.is_at_or_wake_command:
+            message_content = re.sub(r'@\S+\s*', '', message_content).strip()
+        
+        for cmd in self.enable_commands:
+            if message_content.startswith(cmd):
+                message_content = message_content[len(cmd):].strip()
+                break
+                
+        return message_content
 
     @filter.command("对话状态")
     async def show_session_status(self, event: AstrMessageEvent):
@@ -466,21 +592,12 @@ class ContinuousDialoguePlugin(Star):
                 session = self.user_sessions[session_key]
                 duration = int(time.time() - session.start_time)
                 
-                # 获取人格名称
-                persona_name = "默认人格"
-                if session.persona_prompt:
-                    # 尝试从人格提示词中提取人格名称
-                    match = re.search(r"(?:名称|名字|角色)[:：]\s*([^\n]+)", session.persona_prompt)
-                    if match:
-                        persona_name = match.group(1).strip()
-                
                 status_info = f"""
 🔮 连续对话状态
 ├── 状态: 🟢 进行中
-├── 人格: {persona_name}
 ├── 持续时间: {duration}秒
 ├── 消息数量: {session.message_count}条
-├── 最后活动: {int(time.time() - session.last_activity)}秒前
+├── 历史记录: {session.history_records_used}条
 └── 超时时间: {self.session_timeout}秒后自动结束
                 """
             else:
@@ -488,38 +605,33 @@ class ContinuousDialoguePlugin(Star):
         
         yield event.plain_result(status_info)
 
-    @filter.command("结束对话")
-    async def end_session_command(self, event: AstrMessageEvent):
-        """手动结束对话会话"""
-        if not self.enable_plugin:
-            yield event.plain_result("❌ 插件未启用")
+    @filter.command("历史记录")
+    async def show_chat_history(self, event: AstrMessageEvent, count: int = 10):
+        """显示对话历史记录"""
+        if not self.enable_history_storage:
+            yield event.plain_result("❌ 历史记录功能未启用")
             return
             
         group_id = event.get_group_id()
         user_id = event.get_sender_id()
-        session_key = (group_id, user_id)
         
-        async with self.session_lock:
-            if session_key in self.user_sessions:
-                await self._close_user_session(session_key)
-                # 只记录日志，不发送提示消息
-                logger.info(f"用户 {user_id} 通过命令结束连续对话")
-            else:
-                yield event.plain_result("💤 您当前没有进行中的连续对话")
-
-    @filter.command("开始对话")
-    async def start_session_command(self, event: AstrMessageEvent):
-        """通过命令开启对话会话"""
-        if not self.enable_plugin:
-            yield event.plain_result("❌ 插件未启用")
-            return
+        async with self.history_lock:
+            user_history = self._get_user_history(group_id, user_id)
+            recent_records = user_history.get_recent_records(min(count, 20))
             
-        success = await self._start_user_session(event)
-        if success:
-            # 只记录日志，不发送提示消息
-            logger.info(f"用户 {user_id} 通过命令开启连续对话")
-        else:
-            yield event.plain_result("❌ 开启连续对话失败")
+            if not recent_records:
+                yield event.plain_result("📭 暂无历史记录")
+                return
+            
+            history_text = f"📜 最近{len(recent_records)}条对话历史：\n\n"
+            for i, record in enumerate(reversed(recent_records), 1):
+                time_str = datetime.fromtimestamp(record.timestamp).strftime("%H:%M")
+                role_icon = "👤" if record.role == "user" else "🤖"
+                history_text += f"{i}. {time_str} {role_icon} {record.content[:50]}...\n"
+            
+            history_text += f"\n💾 总记录数: {user_history.total_messages}"
+            
+        yield event.plain_result(history_text)
 
     async def terminate(self):
         """插件卸载时清理资源"""
@@ -530,13 +642,3 @@ class ContinuousDialoguePlugin(Star):
                 await self._close_user_session(session_key)
                 
         logger.info("连续对话插件清理完成")
-
-
-# 注册插件
-register(
-    ContinuousDialoguePlugin,
-    "continuous_dialogue_plugin",
-    "assistant",
-    "智能连续对话插件，为用户提供沉浸式对话体验",
-    "1.0.0"
-)
