@@ -1,38 +1,81 @@
 {
   "enable_plugin": {
-    "description": "插件总开关",
+    "description": "启用插件",
     "type": "bool",
     "default": true,
-    "hint": "关闭后，此插件所有功能都将失效。"
+    "hint": "是否启用连续对话插件"
   },
   "session_timeout": {
-    "description": "沉浸式对话超时时间（秒）",
+    "description": "会话超时时间(秒)",
     "type": "int",
     "default": 300,
-    "hint": "用户开启连续对话后，如果在超时时间内没有消息，会话将自动关闭。"
+    "hint": "连续对话会话的超时时间，超过该时间无活动自动结束会话"
   },
   "max_session_messages": {
-    "description": "最大对话轮数",
+    "description": "最大会话消息数",
     "type": "int",
     "default": 20,
-    "hint": "连续对话中最多保存的对话轮数，避免上下文过长。"
+    "hint": "单个会话中允许的最大消息数量"
   },
   "auto_start_on_mention": {
-    "description": "被@时自动开启对话",
+    "description": "@触发自动开始",
     "type": "bool",
     "default": true,
-    "hint": "当用户@机器人时，自动开启连续对话模式。"
+    "hint": "是否在收到@消息时自动开始连续对话"
   },
   "judgment_threshold": {
     "description": "判断阈值",
     "type": "float",
     "default": 0.7,
-    "hint": "大模型判断不回复的置信度阈值，高于此值时会自动结束会话。"
+    "hint": "判断是否回复的置信度阈值(0.0-1.0)"
   },
   "enable_commands": {
-    "description": "触发对话的命令列表",
+    "description": "启用命令",
     "type": "list",
     "default": ["开始对话", "连续对话", "开启对话"],
-    "hint": "用户发送这些命令时，会开启连续对话模式。"
-  }
-}
+    "hint": "触发连续对话的命令列表"
+  },
+  "enable_history_storage": {
+    "description": "启用历史记录存储",
+    "type": "bool",
+    "default": true,
+    "hint": "是否启用聊天历史记录存储功能"
+  },
+  "max_history_records": {
+    "description": "最大历史记录数",
+    "type": "int",
+    "default": 100,
+    "hint": "每个用户保存的最大历史记录条数"
+  },
+  "history_records_to_use": {
+    "description": "使用的历史记录数",
+    "type": "int",
+    "default": 10,
+    "hint": "每次会话使用的历史记录条数"
+  },
+  "history_storage_path": {
+    "description": "历史记录存储路径",
+    "type": "string",
+    "default": "data/continuous_dialogue_history",
+    "hint": "历史记录文件的存储路径"
+  },
+  "enable_persona": {
+    "description": "启用角色设定",
+    "type": "bool",
+    "default": true,
+    "hint": "是否启用角色设定功能"
+  },
+  "use_system_prompt_directly": {
+    "description": "直接使用系统提示词",
+    "type": "bool",
+    "default": true,
+    "hint": "是否直接使用系统提示词作为角色设定"
+  },
+  "persona_override": {
+    "description": "角色设定覆盖",
+    "type": "text",
+    "default": "",
+    "hint": "可选的固定角色设定，将覆盖系统默认设定",
+    "editor_mode": true,
+    "editor_language": "markdown",
+    "editor_theme": "vs
