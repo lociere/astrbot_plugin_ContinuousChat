@@ -103,7 +103,7 @@ class UserSession:
 
 
 @register(
-    "continuous_dialogue",
+    "continuous_dialogue_plugin",
     "assistant",
     "连续对话插件，支持历史记录存储和智能角色设定调用",
     "1.0.0"
