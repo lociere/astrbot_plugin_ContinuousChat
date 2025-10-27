@@ -78,4 +78,6 @@
     "hint": "可选的固定角色设定，将覆盖系统默认设定",
     "editor_mode": true,
     "editor_language": "markdown",
-    "editor_theme": "vs
+    "editor_theme": "vs"
+  }
+}
