@@ -642,3 +642,6 @@ class ContinuousDialoguePlugin(Star):
                 await self._close_user_session(session_key)
                 
         logger.info("连续对话插件清理完成")
+
+
+#111111
